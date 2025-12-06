@@ -60,4 +60,3 @@ const handleSubmit = async (e) => {
   const data = await res.json();
   alert("Buku berhasil ditambah!");
 };
-

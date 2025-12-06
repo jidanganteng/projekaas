@@ -4,6 +4,7 @@ import BookCard from "@/app/components/bookCard";
 import Navbar from "@/app/components/navbar";
 import Footer from "@/app/components/footer";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 
 export default function HomePage() {
   const [books, setBooks] = useState([]);

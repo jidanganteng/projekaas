@@ -1,17 +1,23 @@
 import { db } from "@/app/lib/db";
+import { NextResponse } from "next/server";
 
-// =============================
-// GET - Hanya untuk halaman PINJAMAN (active & history)
-// =============================
 export async function GET(req) {
   try {
     const { searchParams } = new URL(req.url);
     const user_id = searchParams.get("user_id");
-    const status = searchParams.get("status"); // Filter: active/history
+    const status = searchParams.get("status"); // Filter: active/history/pending atau nilai status spesifik
 
     if (!user_id) {
-      return new Response(
-        JSON.stringify({ message: "user_id wajib dikirim" }),
+      return NextResponse.json(
+        { success: false, message: "user_id wajib dikirim" },
+        { status: 400 }
+      );
+    }
+
+    // ✅ VALIDASI: Pastikan user_id numeric
+    if (isNaN(user_id)) {
+      return NextResponse.json(
+        { success: false, message: "user_id harus berupa angka" },
         { status: 400 }
       );
     }
@@ -38,14 +44,22 @@ export async function GET(req) {
 
     const params = [user_id];
 
-    // Filter khusus untuk halaman Pinjaman
-    let statusValues = ['approved', 'borrowed', 'returned']; // Default: semua pinjaman valid
+    // Filter berdasarkan status
+    let statusValues = [];
     if (status) {
       if (status === 'active') {
-        statusValues = ['approved', 'borrowed']; // Sedang dipinjam
+        statusValues = ['approved', 'borrowed'];
       } else if (status === 'history') {
-        statusValues = ['returned']; // Sudah dikembalikan
+        statusValues = ['returned'];
+      } else if (status === 'pending') {
+        statusValues = ['pending'];
+      } else {
+        // Jika status lain, kita anggap sebagai satu nilai status
+        statusValues = [status];
       }
+    } else {
+      // Jika tidak ada status, kita ambil semua status
+      statusValues = ['pending', 'approved', 'borrowed', 'returned'];
     }
 
     // Tambahkan filter status yang aman
@@ -55,31 +69,88 @@ export async function GET(req) {
     query += ` ORDER BY l.loan_date DESC`;
 
     const [rows] = await db.execute(query, params);
-    return Response.json(rows);
-  } catch (error) {
-    console.error("Error GET loans (pinjaman):", error);
-    return new Response(JSON.stringify({ message: "Server error" }), {
-      status: 500,
+    
+    return NextResponse.json({
+      success: true,
+      data: rows,
+      total: rows.length
     });
+    
+  } catch (error) {
+    console.error("Error GET loans:", error);
+    return NextResponse.json(
+      { 
+        success: false, 
+        message: "Gagal mengambil data peminjaman",
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      },
+      { status: 500 }
+    );
   }
 }
-
 // =============================
 // POST - Ajukan peminjaman buku (status: pending)
 // =============================
 export async function POST(req) {
-  // ... kode POST tetap sama seperti sebelumnya ...
   try {
     const { user_id, book_id, days_duration = 7 } = await req.json();
 
+    // ✅ VALIDASI LENGKAP
     if (!user_id || !book_id) {
-      return new Response(
-        JSON.stringify({ message: "user_id dan book_id wajib diisi" }),
+      return NextResponse.json(
+        { success: false, message: "user_id dan book_id wajib diisi" },
         { status: 400 }
       );
     }
 
-    // Cek apakah user sudah meminjam buku ini yang masih aktif
+    if (isNaN(user_id) || isNaN(book_id)) {
+      return NextResponse.json(
+        { success: false, message: "user_id dan book_id harus berupa angka" },
+        { status: 400 }
+      );
+    }
+
+    // 1. Cek apakah user exists
+    const [userCheck] = await db.execute(
+      "SELECT id FROM users WHERE id = ?",
+      [user_id]
+    );
+
+    if (userCheck.length === 0) {
+      return NextResponse.json(
+        { success: false, message: "User tidak ditemukan" },
+        { status: 404 }
+      );
+    }
+
+    // 2. Cek apakah buku exists dan approved
+    const [book] = await db.execute(
+      `SELECT id, title, stock, status FROM books WHERE id = ?`,
+      [book_id]
+    );
+
+    if (book.length === 0) {
+      return NextResponse.json(
+        { success: false, message: "Buku tidak ditemukan" },
+        { status: 404 }
+      );
+    }
+
+    if (book[0].status !== 'approved') {
+      return NextResponse.json(
+        { success: false, message: "Buku belum disetujui untuk dipinjam" },
+        { status: 400 }
+      );
+    }
+
+    if (book[0].stock <= 0) {
+      return NextResponse.json(
+        { success: false, message: "Stok buku habis" },
+        { status: 400 }
+      );
+    }
+
+    // 3. Cek apakah user sudah meminjam buku ini yang masih aktif
     const [existing] = await db.execute(
       `SELECT id FROM loans 
        WHERE user_id = ? AND book_id = ? AND status IN ('pending', 'approved', 'borrowed')`,
@@ -87,89 +158,99 @@ export async function POST(req) {
     );
 
     if (existing.length > 0) {
-      return new Response(
-        JSON.stringify({ message: "⚠️ Anda sudah mengajukan/meminjam buku ini" }),
+      return NextResponse.json(
+        { success: false, message: "Anda sudah mengajukan/meminjam buku ini" },
         { status: 400 }
       );
     }
 
-    // Cek stock buku
-    const [book] = await db.execute(
-      `SELECT stock, title FROM books WHERE id = ?`,
-      [book_id]
-    );
-
-    if (book.length === 0) {
-      return new Response(
-        JSON.stringify({ message: "❌ Buku tidak ditemukan" }),
-        { status: 404 }
-      );
-    }
-
-    if (book[0].stock <= 0) {
-      return new Response(
-        JSON.stringify({ message: "❌ Stok buku habis" }),
-        { status: 400 }
-      );
-    }
-
-    // Hitung due date
+    // 4. Hitung due date
     const dueDate = new Date();
     dueDate.setDate(dueDate.getDate() + parseInt(days_duration));
 
-    // Tambahkan peminjaman baru dengan status pending
+    // 5. Tambahkan peminjaman baru dengan status pending
     const [result] = await db.execute(
       `INSERT INTO loans (user_id, book_id, loan_date, due_date, status)
        VALUES (?, ?, NOW(), ?, 'pending')`,
       [user_id, book_id, dueDate]
     );
 
-    // Tambahkan history
-    await db.execute(
-      `INSERT INTO history (user_id, book_id, action, date_borrowed)
-       VALUES (?, ?, 'pinjam', NOW())`,
-      [user_id, book_id]
+    // 6. Kurangi stok buku (optional - tergantung kebijakan)
+     await db.execute(
+       "UPDATE books SET stock = stock - 1 WHERE id = ?",
+       [book_id]
     );
 
-    // Log admin action
-    await db.execute(
-      `INSERT INTO admin_logs (admin_id, action)
-       VALUES (?, ?)`,
-      [user_id, `User mengajukan pinjaman buku: ${book[0].title}`]
-    );
+    // 7. Tambahkan history jika tabel exists
+    try {
+      await db.execute(
+        `INSERT INTO history (user_id, book_id, action, date_borrowed)
+         VALUES (?, ?, 'pinjam', NOW())`,
+        [user_id, book_id]
+      );
+    } catch (historyError) {
+      console.warn("Tabel history tidak tersedia:", historyError.message);
+    }
 
-    return new Response(
-      JSON.stringify({ 
-        message: "✅ Berhasil mengajukan pinjaman buku. Menunggu persetujuan admin.", 
-        id: result.insertId,
-        due_date: dueDate 
-      }),
+    // 8. Log admin action jika tabel exists
+    try {
+      await db.execute(
+        `INSERT INTO admin_logs (admin_id, action)
+         VALUES (?, ?)`,
+        [user_id, `User mengajukan pinjaman buku: ${book[0].title}`]
+      );
+    } catch (logError) {
+      console.warn("Tabel admin_logs tidak tersedia:", logError.message);
+    }
+
+    return NextResponse.json(
+      { 
+        success: true,
+        message: "Berhasil mengajukan pinjaman buku. Menunggu persetujuan admin.", 
+        data: {
+          id: result.insertId,
+          due_date: dueDate 
+        }
+      },
       { status: 201 }
     );
   } catch (error) {
     console.error("Error POST loans:", error);
-    return new Response(JSON.stringify({ message: "Server error" }), {
-      status: 500,
-    });
+    return NextResponse.json(
+      { 
+        success: false, 
+        message: "Gagal mengajukan peminjaman",
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      },
+      { status: 500 }
+    );
   }
 }
 
 // =============================
-// PUT - Update status peminjaman (untuk pengembalian & persetujuan)
+// PUT - Update status peminjaman
 // =============================
 export async function PUT(req) {
-  // ... kode PUT tetap sama seperti sebelumnya ...
   try {
     const { loan_id, action, admin_id, reason } = await req.json();
 
+    // ✅ VALIDASI
     if (!loan_id || !action) {
-      return new Response(
-        JSON.stringify({ message: "loan_id dan action wajib diisi" }),
+      return NextResponse.json(
+        { success: false, message: "loan_id dan action wajib diisi" },
+        { status: 400 }
+      );
+    }
+
+    if (isNaN(loan_id)) {
+      return NextResponse.json(
+        { success: false, message: "loan_id harus berupa angka" },
         { status: 400 }
       );
     }
 
     let message = "";
+    let success = true;
 
     switch (action) {
       case 'return':
@@ -179,8 +260,8 @@ export async function PUT(req) {
         );
 
         if (loanInfo.length === 0) {
-          return new Response(
-            JSON.stringify({ message: "❌ Pinjaman tidak ditemukan atau bukan status borrowed" }),
+          return NextResponse.json(
+            { success: false, message: "Pinjaman tidak ditemukan atau bukan status borrowed" },
             { status: 400 }
           );
         }
@@ -197,19 +278,13 @@ export async function PUT(req) {
           [loanInfo[0].book_id]
         );
 
-        await db.execute(
-          `INSERT INTO history (user_id, book_id, action, date_borrowed)
-           SELECT user_id, book_id, 'kembali', NOW() FROM loans WHERE id = ?`,
-          [loan_id]
-        );
-
-        message = "✅ Buku berhasil dikembalikan";
+        message = "Buku berhasil dikembalikan";
         break;
 
       case 'approve':
         if (!admin_id) {
-          return new Response(
-            JSON.stringify({ message: "admin_id wajib diisi untuk persetujuan" }),
+          return NextResponse.json(
+            { success: false, message: "admin_id wajib diisi untuk persetujuan" },
             { status: 400 }
           );
         }
@@ -220,8 +295,8 @@ export async function PUT(req) {
         );
 
         if (pendingLoan.length === 0) {
-          return new Response(
-            JSON.stringify({ message: "❌ Pinjaman tidak ditemukan atau sudah diproses" }),
+          return NextResponse.json(
+            { success: false, message: "Pinjaman tidak ditemukan atau sudah diproses" },
             { status: 400 }
           );
         }
@@ -238,79 +313,95 @@ export async function PUT(req) {
           [admin_id, loan_id]
         );
 
-        await db.execute(
-          `INSERT INTO admin_logs (admin_id, action)
-           VALUES (?, ?)`,
-          [admin_id, `Menyetujui pinjaman ID: ${loan_id}`]
-        );
-
-        message = "✅ Pinjaman berhasil disetujui";
+        message = "Pinjaman berhasil disetujui";
         break;
 
       case 'reject':
         if (!admin_id) {
-          return new Response(
-            JSON.stringify({ message: "admin_id wajib diisi untuk penolakan" }),
+          return NextResponse.json(
+            { success: false, message: "admin_id wajib diisi untuk penolakan" },
             { status: 400 }
           );
         }
 
-        await db.execute(
+        const [rejectResult] = await db.execute(
           `UPDATE loans 
            SET status = 'rejected', approved_by = ?, approved_at = NOW(), admin_notes = ?
            WHERE id = ? AND status = 'pending'`,
           [admin_id, reason || 'Ditolak oleh admin', loan_id]
         );
 
-        await db.execute(
-          `INSERT INTO admin_logs (admin_id, action)
-           VALUES (?, ?)`,
-          [admin_id, `Menolak pinjaman ID: ${loan_id} - Alasan: ${reason || 'Tidak disebutkan'}`]
-        );
+        if (rejectResult.affectedRows === 0) {
+          return NextResponse.json(
+            { success: false, message: "Pinjaman tidak ditemukan atau sudah diproses" },
+            { status: 400 }
+          );
+        }
 
-        message = "✅ Pinjaman berhasil ditolak";
+        message = "Pinjaman berhasil ditolak";
         break;
 
       case 'start_borrow':
-        await db.execute(
+        const [borrowResult] = await db.execute(
           `UPDATE loans 
            SET status = 'borrowed'
            WHERE id = ? AND status = 'approved'`,
           [loan_id]
         );
 
-        message = "✅ Peminjaman berhasil dimulai";
+        if (borrowResult.affectedRows === 0) {
+          return NextResponse.json(
+            { success: false, message: "Pinjaman tidak ditemukan atau status tidak sesuai" },
+            { status: 400 }
+          );
+        }
+
+        message = "Peminjaman berhasil dimulai";
         break;
 
       default:
-        return new Response(
-          JSON.stringify({ message: "❌ Action tidak valid" }),
+        return NextResponse.json(
+          { success: false, message: "Action tidak valid" },
           { status: 400 }
         );
     }
 
-    return Response.json({ message });
+    return NextResponse.json({
+      success: true,
+      message: message
+    });
   } catch (error) {
     console.error("Error PUT loans:", error);
-    return new Response(JSON.stringify({ message: "Server error" }), {
-      status: 500,
-    });
+    return NextResponse.json(
+      { 
+        success: false, 
+        message: "Gagal memproses peminjaman",
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      },
+      { status: 500 }
+    );
   }
 }
 
 // =============================
-// DELETE - Batalkan pinjaman (hanya untuk status pending)
+// DELETE - Batalkan pinjaman
 // =============================
 export async function DELETE(req) {
-  // ... kode DELETE tetap sama seperti sebelumnya ...
   try {
     const { searchParams } = new URL(req.url);
     const loan_id = searchParams.get("loan_id");
     const user_id = searchParams.get("user_id");
 
     if (!loan_id || !user_id) {
-      return new Response(
-        JSON.stringify({ message: "loan_id dan user_id wajib diisi" }),
+      return NextResponse.json(
+        { success: false, message: "loan_id dan user_id wajib diisi" },
+        { status: 400 }
+      );
+    }
+
+    if (isNaN(loan_id) || isNaN(user_id)) {
+      return NextResponse.json(
+        { success: false, message: "loan_id dan user_id harus berupa angka" },
         { status: 400 }
       );
     }
@@ -322,17 +413,25 @@ export async function DELETE(req) {
     );
 
     if (result.affectedRows === 0) {
-      return new Response(
-        JSON.stringify({ message: "❌ Pinjaman tidak ditemukan atau tidak dapat dibatalkan" }),
+      return NextResponse.json(
+        { success: false, message: "Pinjaman tidak ditemukan atau tidak dapat dibatalkan" },
         { status: 400 }
       );
     }
 
-    return Response.json({ message: "✅ Pinjaman berhasil dibatalkan" });
+    return NextResponse.json({ 
+      success: true,
+      message: "Pinjaman berhasil dibatalkan" 
+    });
   } catch (error) {
     console.error("Error DELETE loans:", error);
-    return new Response(JSON.stringify({ message: "Server error" }), {
-      status: 500,
-    });
+    return NextResponse.json(
+      { 
+        success: false, 
+        message: "Gagal membatalkan peminjaman",
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      },
+      { status: 500 }
+    );
   }
 }
